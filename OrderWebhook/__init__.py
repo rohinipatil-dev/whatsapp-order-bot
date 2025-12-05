@@ -16,34 +16,39 @@ AZURE_OPENAI_ENDPOINT = os.environ["AZURE_OPENAI_ENDPOINT"]
 AZURE_OPENAI_KEY = os.environ["AZURE_OPENAI_KEY"]
 
 def main(req: func.HttpRequest) -> func.HttpResponse:
-    logging.info("WhatsApp voice webhook triggered.")
+    try:
+        logging.info("WhatsApp voice webhook triggered.")
 
-    # Step 1: Parse Twilio webhook payload
-    media_url = req.form.get("MediaUrl0")
-    from_number = req.form.get("From")
+        # Step 1: Parse Twilio webhook payload
+        media_url = req.form.get("MediaUrl0")
+        from_number = req.form.get("From")
 
-    if not media_url:
-        return func.HttpResponse("No media found", status_code=400)
+        if not media_url:
+            return func.HttpResponse("No media found", status_code=400)
 
-    # Step 2: Download voice file
-    voice_file_path = download_voice(media_url)
+        # Step 2: Download voice file
+        voice_file_path = download_voice(media_url)
 
-    # Step 3: Upload to Azure Blob
-    blob_url = upload_to_blob(voice_file_path)
+        # Step 3: Upload to Azure Blob
+        blob_url = upload_to_blob(voice_file_path)
 
-    # Step 4: Transcribe using Azure Speech (or Foundry)
-    transcription = transcribe_audio(blob_url)
+        # Step 4: Transcribe using Azure Speech (or Foundry)
+        transcription = transcribe_audio(blob_url)
 
-    # Step 5: Parse item & quantity using Azure OpenAI
-    parsed_order = parse_order(transcription)
+        # Step 5: Parse item & quantity using Azure OpenAI
+        parsed_order = parse_order(transcription)
 
-    # Step 6: Log to Excel
-    log_to_excel(parsed_order, from_number)
+        # Step 6: Log to Excel
+        log_to_excel(parsed_order, from_number)
 
-    # Step 7: Optional: send confirmation (via Twilio API)
-    # send_confirmation(from_number, parsed_order)
+        # Step 7: Optional: send confirmation (via Twilio API)
+        # send_confirmation(from_number, parsed_order)
 
-    return func.HttpResponse(f"Order logged: {parsed_order}")
+        return func.HttpResponse(f"Order logged: {parsed_order}")
+    except Exception as e:
+        logging.exception("Unhandled error in WhatsApp webhook")
+        return func.HttpResponse(f"Internal server error: {e}", status_code=500)
+
 
 # ---------------- Helper functions ----------------
 def download_voice(media_url):
