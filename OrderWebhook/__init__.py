@@ -19,14 +19,16 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
     try:
         logging.info("WhatsApp voice webhook triggered.")
 
-        # Read environment variables (fail early with clear message)
+        # Read environment variables
         BLOB_CONN_STR = os.environ.get("BLOB_CONN_STR")
         BLOB_CONTAINER = os.environ.get("BLOB_CONTAINER")
         EXCEL_BLOB_NAME = os.environ.get("EXCEL_BLOB_NAME")
         AZURE_OPENAI_ENDPOINT = os.environ.get("AZURE_OPENAI_ENDPOINT")
         AZURE_OPENAI_KEY = os.environ.get("AZURE_OPENAI_KEY")
+        TWILIO_SID = os.environ.get("TWILIO_SID")
+        TWILIO_AUTH = os.environ.get("TWILIO_AUTH")
 
-        if not all([BLOB_CONN_STR, BLOB_CONTAINER, EXCEL_BLOB_NAME, AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_KEY]):
+        if not all([BLOB_CONN_STR, BLOB_CONTAINER, EXCEL_BLOB_NAME, AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_KEY, TWILIO_AUTH, TWILIO_SID]):
             logging.error("Missing one or more required environment variables")
             return func.HttpResponse("Missing environment variables", status_code=500)
 
@@ -58,7 +60,8 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             return func.HttpResponse("No media found", status_code=400)
 
         # Step 2: Download voice file (to a temp file)
-        voice_file_path = download_voice(media_url)
+        # Pass Twilio credentials so requests can authenticate when downloading Twilio-hosted media
+        voice_file_path = download_voice(media_url, twilio_sid=TWILIO_SID, twilio_auth=TWILIO_AUTH)
 
         try:
             # Step 3: Upload to Azure Blob
@@ -95,13 +98,18 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
 
 
 # ---------------- Helper functions ----------------
-def download_voice(media_url, timeout=15):
+def download_voice(media_url, twilio_sid=None, twilio_auth=None, timeout=15):
     """
     Downloads the media URL to a uniquely named temp file and returns the path.
     Raises on network errors so caller can log and return proper status code.
     """
     logging.info("Downloading media from %s", media_url)
-    r = requests.get(media_url, stream=True, timeout=timeout)
+    auth = None
+    if twilio_sid and twilio_auth:
+        auth = (twilio_sid, twilio_auth)
+
+    r = requests.get(media_url, stream=True, timeout=timeout, auth=auth)
+    # If unauthorized, this will raise an HTTPError that we will log at the caller
     r.raise_for_status()
     suffix = os.path.splitext(media_url.split("?")[0])[1] or ".ogg"
     filename = os.path.join(tempfile.gettempdir(), f"temp_voice_{uuid.uuid4().hex}{suffix}")
