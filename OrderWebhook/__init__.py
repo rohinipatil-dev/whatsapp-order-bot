@@ -8,16 +8,19 @@ from azure.storage.blob import BlobServiceClient
 from azure.ai.textanalytics import TextAnalyticsClient
 from azure.core.credentials import AzureKeyCredential
 
-# Environment variables
-BLOB_CONN_STR = os.environ["BLOB_CONN_STR"]
-BLOB_CONTAINER = os.environ["BLOB_CONTAINER"]
-EXCEL_BLOB_NAME = os.environ["EXCEL_BLOB_NAME"]
-AZURE_OPENAI_ENDPOINT = os.environ["AZURE_OPENAI_ENDPOINT"]
-AZURE_OPENAI_KEY = os.environ["AZURE_OPENAI_KEY"]
-
 def main(req: func.HttpRequest) -> func.HttpResponse:
     try:
         logging.info("WhatsApp voice webhook triggered.")
+
+        # Environment variables (move here to catch errors)
+        BLOB_CONN_STR = os.environ.get("BLOB_CONN_STR")
+        BLOB_CONTAINER = os.environ.get("BLOB_CONTAINER")
+        EXCEL_BLOB_NAME = os.environ.get("EXCEL_BLOB_NAME")
+        AZURE_OPENAI_ENDPOINT = os.environ.get("AZURE_OPENAI_ENDPOINT")
+        AZURE_OPENAI_KEY = os.environ.get("AZURE_OPENAI_KEY")
+
+        if not all([BLOB_CONN_STR, BLOB_CONTAINER, EXCEL_BLOB_NAME, AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_KEY]):
+            return func.HttpResponse("Missing environment variables", status_code=500)
 
         # Step 1: Parse Twilio webhook payload
         media_url = req.form.get("MediaUrl0")
