@@ -36,7 +36,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         AZURE_SPEECH_REGION = os.environ.get("AZURE_SPEECH_REGION")
         AZURE_SPEECH_LANGUAGES = os.environ.get("AZURE_SPEECH_LANGUAGES")  # comma-separated list for auto-detect
 
-        # Azure OpenAI
+        # Azure OpenAI (these remain optional; parse_order will check)
         AZURE_OPENAI_ENDPOINT = os.environ.get("AZURE_OPENAI_ENDPOINT")
         AZURE_OPENAI_KEY = os.environ.get("AZURE_OPENAI_KEY")
         AZURE_OPENAI_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT")
@@ -45,12 +45,12 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         TWILIO_SID = os.environ.get("TWILIO_SID")
         TWILIO_AUTH = os.environ.get("TWILIO_AUTH")
 
-        if not all([BLOB_CONN_STR, BLOB_CONTAINER, EXCEL_BLOB_NAME, AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_KEY, TWILIO_AUTH, TWILIO_SID]):
-            logging.error("Missing one or more required environment variables")
-            return func.HttpResponse("Missing environment variables", status_code=500)
+        if not all([BLOB_CONN_STR, BLOB_CONTAINER, EXCEL_BLOB_NAME]):
+            logging.error("Missing one or more required storage environment variables (BLOB_CONN_STR, BLOB_CONTAINER, EXCEL_BLOB_NAME).")
+            return func.HttpResponse("Missing storage configuration", status_code=500)
 
         # Parse Twilio form or JSON
-        content_type = req.headers.get("Content-Type", "")
+        content_type = (req.headers.get("Content-Type") or req.headers.get("content-type") or "").lower()
         form = {}
         if "application/x-www-form-urlencoded" in content_type:
             body = req.get_body().decode("utf-8", errors="replace")
@@ -95,7 +95,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                 auto_detect_languages=speech_langs
             )
 
-            # Step 5: Parse using Azure OpenAI (chat) if configured else fallback regex
+            # Step 5: Parse using Azure OpenAI (via openai package) if configured else fallback regex
             parsed_order = parse_order(
                 transcription,
                 openai_endpoint=AZURE_OPENAI_ENDPOINT,
@@ -130,14 +130,9 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
 # ---------------- Helper functions ----------------
 
 def download_voice(media_url, twilio_sid=None, twilio_auth=None, timeout=30):
-    """
-    Downloads the media URL to a uniquely named temp file and returns the path.
-    Raises on network errors so caller can log and return proper status code.
-    """
     logging.info("Downloading media from %s", media_url)
     auth = (twilio_sid, twilio_auth) if twilio_sid and twilio_auth else None
     r = requests.get(media_url, stream=True, timeout=timeout, auth=auth)
-    # If unauthorized, this will raise an HTTPError that we will log at the caller
     r.raise_for_status()
     suffix = os.path.splitext(urlparse(media_url).path)[1] or ".ogg"
     filename = os.path.join(tempfile.gettempdir(), f"temp_voice_{uuid.uuid4().hex}{suffix}")
@@ -150,18 +145,12 @@ def download_voice(media_url, twilio_sid=None, twilio_auth=None, timeout=30):
 
 
 def upload_to_blob(local_file, conn_str, container_name):
-    """
-    Uploads local_file to the specified container and returns the blob URL.
-    Uses a timestamped/uuid blob name to avoid collisions.
-    """
     blob_service_client = BlobServiceClient.from_connection_string(conn_str)
     container_client = blob_service_client.get_container_client(container_name)
-    # Ensure container exists
     try:
         container_client.create_container()
         logging.info("Created container %s", container_name)
     except Exception:
-        # Likely already exists; ignore
         pass
     blob_name = f"voices/{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex}{os.path.splitext(local_file)[1]}"
     blob_client = container_client.get_blob_client(blob=blob_name)
@@ -173,19 +162,9 @@ def upload_to_blob(local_file, conn_str, container_name):
 
 
 def transcribe_audio(blob_url, conn_str=None, speech_key=None, speech_region=None, auto_detect_languages=None):
-    """
-    Transcribes the audio file referenced by blob_url.
-    - If speech_key and speech_region are provided *and* azure.cognitiveservices.speech is installed, the Azure Speech SDK is used.
-      - If auto_detect_languages (list) is provided, Azure Speech auto-language detection is used.
-    - Otherwise, returns an empty string (or you can change fallback behavior).
-    Notes:
-      - For short voice notes recognize_once() is fine.
-      - For long files consider using Batch Transcription (async).
-    """
     logging.info("Transcribing audio at %s", blob_url)
     download_path = None
     try:
-        # Download blob to a temp file (so Speech SDK can read it)
         if conn_str:
             parsed = urlparse(blob_url)
             path = parsed.path.lstrip("/")
@@ -224,7 +203,6 @@ def transcribe_audio(blob_url, conn_str=None, speech_key=None, speech_region=Non
                     auto_detect_config = speechsdk.AutoDetectSourceLanguageConfig(languages=auto_detect_languages)
                     recognizer = speechsdk.SpeechRecognizer(speech_config=speech_config, audio_config=audio_config, auto_detect_source_language_config=auto_detect_config)
                     result = recognizer.recognize_once()
-                    # Try to read detected language from properties if available
                     try:
                         detection = result.properties.get(speechsdk.PropertyId.SpeechServiceConnection_AutoDetectSourceLanguageResult)
                         logging.info("Auto-detected language result: %s", detection)
@@ -261,43 +239,68 @@ def transcribe_audio(blob_url, conn_str=None, speech_key=None, speech_region=Non
 def parse_order(transcribed_text, openai_endpoint=None, openai_key=None, openai_deployment=None):
     """
     Parse transcribed_text into {'quantity': int|None, 'item': str|None}.
-    - If Azure OpenAI config provided, uses chat completion and requests strict JSON in the assistant response.
+    - If Azure OpenAI config provided, uses the openai package configured for Azure.
     - Otherwise falls back to a regex parser.
     """
     logging.info("Parsing transcription: %s", transcribed_text)
 
-    # Try Azure OpenAI (chat) if configured
+    # Try Azure OpenAI via openai package if configured
     if openai_endpoint and openai_key and openai_deployment:
         try:
-            from azure.ai.openai import OpenAIClient
-            from azure.core.credentials import AzureKeyCredential
-            client = OpenAIClient(openai_endpoint, AzureKeyCredential(openai_key))
+            try:
+                import openai
+            except ImportError:
+                logging.warning("openai package is not installed; falling back to regex parser.")
+                raise
 
-            system = {
+            # Configure openai package for Azure usage
+            openai.api_type = "azure"
+            openai.api_base = openai_endpoint.rstrip("/")  # e.g. https://<resource>.openai.azure.com
+            openai.api_version = "2023-05-15"  # update if your resource expects a different API version
+            openai.api_key = openai_key
+
+            system_msg = {
                 "role": "system",
-                "content": "You are a precise JSON generator. Respond with only a single JSON object with keys: 'quantity' (integer or null) and 'item' (string or null). Do not include any explanatory text."
+                "content": "You are a precise JSON generator. Respond with ONLY a single JSON object with keys: 'quantity' (integer or null) and 'item' (string or null). Respond with valid JSON only, no additional text."
             }
-            user = {
+            user_msg = {
                 "role": "user",
                 "content": f"Extract quantity and item from this customer transcription: \"{transcribed_text}\". Example: {{\"quantity\": 3, \"item\": \"bottles\"}}"
             }
 
-            # Use chat completions
-            resp = client.get_chat_completions(deployment=openai_deployment, messages=[system, user], max_tokens=80, temperature=0)
-            # Extract text
+            resp = openai.ChatCompletion.create(
+                engine=openai_deployment,
+                messages=[system_msg, user_msg],
+                max_tokens=80,
+                temperature=0
+            )
+
+            # extract content robustly
             content = ""
             try:
-                content = resp.choices[0].message.content
+                # response is usually a dict
+                content = resp["choices"][0]["message"]["content"]
             except Exception:
-                # Fallback to stringifying response
+                # fallback: stringify and try to find JSON inside
                 content = str(resp)
 
-            logging.debug("Azure OpenAI raw content: %s", content)
+            # Try parsing full content as JSON first
+            obj = None
+            try:
+                obj = json.loads(content)
+            except json.JSONDecodeError:
+                # fallback: try to extract first {...} substring
+                m = re.search(r"\{.*\}", content, re.DOTALL)
+                if m:
+                    try:
+                        obj = json.loads(m.group(0))
+                    except Exception:
+                        logging.debug("Failed to json.loads extracted substring from OpenAI content.")
+                        obj = None
+                else:
+                    logging.debug("OpenAI response did not contain a JSON object.")
 
-            # Extract JSON substring
-            m = re.search(r"\{.*\}", content, re.DOTALL)
-            if m:
-                obj = json.loads(m.group(0))
+            if obj:
                 qty = obj.get("quantity")
                 try:
                     qty = int(qty) if qty is not None else None
@@ -308,9 +311,9 @@ def parse_order(transcribed_text, openai_endpoint=None, openai_key=None, openai_
                     item = item.strip().lower()
                 return {"quantity": qty, "item": item}
             else:
-                logging.warning("OpenAI response did not contain JSON; falling back to regex.")
+                logging.warning("OpenAI response could not be parsed as JSON; falling back to regex parser.")
         except Exception:
-            logging.exception("Azure OpenAI parse failed; falling back to regex parser.")
+            logging.exception("Azure OpenAI (openai package) parse failed; falling back to regex parser.")
 
     # Fallback regex-based parser
     try:
@@ -330,16 +333,11 @@ def parse_order(transcribed_text, openai_endpoint=None, openai_key=None, openai_
 
 
 def log_to_excel(order, customer_number, conn_str, container_name, excel_blob_name):
-    """
-    Downloads the Excel workbook from blob storage (or creates one if missing),
-    appends the order row, and uploads it back.
-    """
     logging.info("Logging order to Excel: %s", order)
     blob_service_client = BlobServiceClient.from_connection_string(conn_str)
     container_client = blob_service_client.get_container_client(container_name)
     blob_client = container_client.get_blob_client(excel_blob_name)
 
-    # Prepare temp file paths
     download_file = os.path.join(tempfile.gettempdir(), f"orders_{uuid.uuid4().hex}.xlsx")
     try:
         logging.info("Downloading Excel blob %s from container %s", excel_blob_name, container_name)
@@ -355,16 +353,13 @@ def log_to_excel(order, customer_number, conn_str, container_name, excel_blob_na
         wb = load_workbook(download_file)
         ws = wb.active
 
-    # Append row and save
     ws.append([datetime.utcnow().isoformat(), customer_number, order.get("item"), order.get("quantity")])
     wb.save(download_file)
 
-    # Upload updated workbook
     with open(download_file, "rb") as data:
         blob_client.upload_blob(data, overwrite=True)
     logging.info("Uploaded updated Excel to blob %s", excel_blob_name)
 
-    # Cleanup temp file
     try:
         if os.path.exists(download_file):
             os.remove(download_file)
@@ -374,12 +369,18 @@ def log_to_excel(order, customer_number, conn_str, container_name, excel_blob_na
 # Optional Twilio confirmation
 def send_confirmation(to_number, order):
     from twilio.rest import Client
-    TWILIO_SID = os.environ["TWILIO_SID"]
-    TWILIO_AUTH = os.environ["TWILIO_AUTH"]
-    TWILIO_WHATSAPP = os.environ["TWILIO_WHATSAPP_NUMBER"]
+    TWILIO_SID = os.environ.get("TWILIO_SID")
+    TWILIO_AUTH = os.environ.get("TWILIO_AUTH")
+    TWILIO_WHATSAPP = os.environ.get("TWILIO_WHATSAPP_NUMBER")
+
+    if not all([TWILIO_SID, TWILIO_AUTH, TWILIO_WHATSAPP]):
+        logging.warning("Twilio config incomplete; skipping confirmation message.")
+        return
 
     client = Client(TWILIO_SID, TWILIO_AUTH)
-    message = f"Your order of {order['quantity']} {order['item']} has been logged."
+    qty = order.get("quantity") or ""
+    item = order.get("item") or ""
+    message = f"Your order of {qty} {item} has been logged."
     client.messages.create(
         body=message,
         from_=f"whatsapp:{TWILIO_WHATSAPP}",

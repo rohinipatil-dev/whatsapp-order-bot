@@ -2,6 +2,6 @@ azure-functions
 requests
 openpyxl
 azure-storage-blob
-azure-ai-openai
+openai
 azure-cognitiveservices-speech
 twilio
