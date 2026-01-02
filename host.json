@@ -1,3 +1,24 @@
 {
-  "version": "2.0"
+  "version": "2.0",
+  "logging": {
+    "console": {
+      "isEnabled": true,
+      "level": "Trace"
+    },
+    "logLevel": {
+      "default": "Trace",
+      "Function": "Trace",
+      "Host": "Trace",
+      "Worker": "Trace"
+    },
+    "applicationInsights": {
+      "samplingSettings": {
+        "isEnabled": false
+      }
+    }
+  },
+  "extensionBundle": {
+    "id": "Microsoft.Azure.Functions.ExtensionBundle",
+    "version": "[4.*, 5.0.0)"
+  }
 }
