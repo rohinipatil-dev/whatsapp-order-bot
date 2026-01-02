@@ -1,18 +1,10 @@
 import logging
 import azure.functions as func
-import requests
 import os
-from datetime import datetime
-from openpyxl import load_workbook, Workbook
-from azure.storage.blob import BlobServiceClient
-from urllib.parse import parse_qs, urlparse
-import uuid
-import tempfile
 import traceback
-import json
-import re
-from azure.core.exceptions import ResourceModifiedError
-from azure.core import MatchConditions
+
+logging.basicConfig(level=logging.INFO)
+logging.info("Module import started")
 
 # NOTE: This module expects the following environment variables to be set for full functionality:
 # - BLOB_CONN_STR, BLOB_CONTAINER, EXCEL_BLOB_NAME
@@ -26,6 +18,14 @@ from azure.core import MatchConditions
 
 def main(req: func.HttpRequest) -> func.HttpResponse:
     try:
+        import requests
+        from datetime import datetime
+        from urllib.parse import parse_qs, urlparse
+        import uuid
+        import tempfile
+        import json
+        import re
+
         logging.info("WhatsApp voice webhook triggered.")
 
         # Read required environment variables
@@ -132,6 +132,11 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
 # ---------------- Helper functions ----------------
 
 def download_voice(media_url, twilio_sid=None, twilio_auth=None, timeout=30):
+    import requests
+    import tempfile
+    import uuid
+    from urllib.parse import urlparse
+
     logging.info("Downloading media from %s", media_url)
     auth = (twilio_sid, twilio_auth) if twilio_sid and twilio_auth else None
     r = requests.get(media_url, stream=True, timeout=timeout, auth=auth)
@@ -147,6 +152,10 @@ def download_voice(media_url, twilio_sid=None, twilio_auth=None, timeout=30):
 
 
 def upload_to_blob(local_file, conn_str, container_name):
+    from azure.storage.blob import BlobServiceClient
+    from datetime import datetime
+    import uuid
+
     blob_service_client = BlobServiceClient.from_connection_string(conn_str)
     container_client = blob_service_client.get_container_client(container_name)
     try:
@@ -164,6 +173,12 @@ def upload_to_blob(local_file, conn_str, container_name):
 
 
 def transcribe_audio(blob_url, conn_str=None, speech_key=None, speech_region=None, auto_detect_languages=None):
+    import tempfile
+    import uuid
+    import requests
+    from urllib.parse import urlparse
+    from azure.storage.blob import BlobServiceClient
+
     logging.info("Transcribing audio at %s", blob_url)
     download_path = None
     try:
@@ -244,6 +259,9 @@ def parse_order(transcribed_text, openai_endpoint=None, openai_key=None, openai_
     - If Azure OpenAI config provided, uses the openai package configured for Azure.
     - Otherwise falls back to a regex parser.
     """
+    import json
+    import re
+
     logging.info("Parsing transcription: %s", transcribed_text)
 
     # Try Azure OpenAI via openai package if configured
@@ -359,6 +377,14 @@ def log_to_excel(order, customer_number, conn_str, container_name, excel_blob_na
         excel_blob_name: Name of the Excel blob
         max_retries: Maximum number of retry attempts on conflicts (default: 5)
     """
+    from azure.storage.blob import BlobServiceClient
+    from openpyxl import Workbook, load_workbook
+    from azure.core import MatchConditions
+    from azure.core.exceptions import ResourceModifiedError
+    import tempfile
+    import uuid
+    from datetime import datetime
+
     logging.info("Logging order to Excel: %s", order)
     blob_service_client = BlobServiceClient.from_connection_string(conn_str)
     container_client = blob_service_client.get_container_client(container_name)
