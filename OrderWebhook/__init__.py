@@ -11,6 +11,8 @@ import tempfile
 import traceback
 import json
 import re
+from azure.core.exceptions import ResourceModifiedError
+from azure.core import MatchConditions
 
 # NOTE: This module expects the following environment variables to be set for full functionality:
 # - BLOB_CONN_STR, BLOB_CONTAINER, EXCEL_BLOB_NAME
@@ -248,16 +250,17 @@ def parse_order(transcribed_text, openai_endpoint=None, openai_key=None, openai_
     if openai_endpoint and openai_key and openai_deployment:
         try:
             try:
-                import openai
+                from openai import AzureOpenAI
             except ImportError:
                 logging.warning("openai package is not installed; falling back to regex parser.")
                 raise
 
-            # Configure openai package for Azure usage
-            openai.api_type = "azure"
-            openai.api_base = openai_endpoint.rstrip("/")  # e.g. https://<resource>.openai.azure.com
-            openai.api_version = "2023-05-15"  # update if your resource expects a different API version
-            openai.api_key = openai_key
+            # Initialize Azure OpenAI client (modern SDK v1.0+)
+            client = AzureOpenAI(
+                azure_endpoint=openai_endpoint.rstrip("/"),
+                api_key=openai_key,
+                api_version="2024-02-15-preview"  # Use latest stable API version
+            )
 
             system_msg = {
                 "role": "system",
@@ -268,21 +271,21 @@ def parse_order(transcribed_text, openai_endpoint=None, openai_key=None, openai_
                 "content": f"Extract quantity and item from this customer transcription: \"{transcribed_text}\". Example: {{\"quantity\": 3, \"item\": \"bottles\"}}"
             }
 
-            resp = openai.ChatCompletion.create(
-                engine=openai_deployment,
+            # Use new API format
+            response = client.chat.completions.create(
+                model=openai_deployment,
                 messages=[system_msg, user_msg],
                 max_tokens=80,
                 temperature=0
             )
 
-            # extract content robustly
+            # Extract content from response
             content = ""
             try:
-                # response is usually a dict
-                content = resp["choices"][0]["message"]["content"]
-            except Exception:
-                # fallback: stringify and try to find JSON inside
-                content = str(resp)
+                content = response.choices[0].message.content
+            except Exception as e:
+                logging.warning("Failed to extract content from OpenAI response: %s", e)
+                content = str(response)
 
             # Try parsing full content as JSON first
             obj = None
@@ -317,54 +320,134 @@ def parse_order(transcribed_text, openai_endpoint=None, openai_key=None, openai_
 
     # Fallback regex-based parser
     try:
-        # digits
+        # Match digits followed by item name
         m = re.search(r"(\d+)\s+([A-Za-z\u0600-\u06FF][\w\u0600-\u06FF\s-]*)", transcribed_text, re.UNICODE)
         if m:
             return {"quantity": int(m.group(1)), "item": m.group(2).strip().lower()}
-        # spelled numbers (basic)
-        words_to_num = {"one":1,"two":2,"three":3,"four":4,"five":5,"six":6,"seven":7,"eight":8,"nine":9,"ten":10}
-        m2 = re.search(r"\b(" + "|".join(words_to_num.keys()) + r")\b\s+([A-Za-z\u0600-\u06FF][\w\u0600-\u06FF\s-]*)", transcribed_text, re.IGNORECASE)
+        
+        # Match spelled-out numbers (basic)
+        words_to_num = {
+            "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+            "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10
+        }
+        m2 = re.search(
+            r"\b(" + "|".join(words_to_num.keys()) + r")\b\s+([A-Za-z\u0600-\u06FF][\w\u0600-\u06FF\s-]*)",
+            transcribed_text,
+            re.IGNORECASE
+        )
         if m2:
-            return {"quantity": words_to_num.get(m2.group(1).lower()), "item": m2.group(2).strip().lower()}
+            return {
+                "quantity": words_to_num.get(m2.group(1).lower()),
+                "item": m2.group(2).strip().lower()
+            }
     except Exception:
         logging.exception("Regex parsing failed")
 
     return {"quantity": None, "item": None}
 
 
-def log_to_excel(order, customer_number, conn_str, container_name, excel_blob_name):
+def log_to_excel(order, customer_number, conn_str, container_name, excel_blob_name, max_retries=5):
+    """
+    Log order to Excel with optimistic concurrency control to prevent race conditions.
+    Uses ETag-based locking to ensure no data is lost when multiple requests arrive simultaneously.
+    
+    Args:
+        order: Dict with 'item' and 'quantity'
+        customer_number: Customer's phone number
+        conn_str: Azure Storage connection string
+        container_name: Blob container name
+        excel_blob_name: Name of the Excel blob
+        max_retries: Maximum number of retry attempts on conflicts (default: 5)
+    """
     logging.info("Logging order to Excel: %s", order)
     blob_service_client = BlobServiceClient.from_connection_string(conn_str)
     container_client = blob_service_client.get_container_client(container_name)
     blob_client = container_client.get_blob_client(excel_blob_name)
 
-    download_file = os.path.join(tempfile.gettempdir(), f"orders_{uuid.uuid4().hex}.xlsx")
-    try:
-        logging.info("Downloading Excel blob %s from container %s", excel_blob_name, container_name)
-        with open(download_file, "wb") as f:
-            stream = blob_client.download_blob()
-            f.write(stream.readall())
-    except Exception as ex:
-        logging.warning("Creating new workbook because download failed: %s", ex)
-        wb = Workbook()
-        ws = wb.active
-        ws.append(["timestamp_utc", "customer_number", "item", "quantity"])
-    else:
-        wb = load_workbook(download_file)
-        ws = wb.active
+    retry_count = 0
+    
+    while retry_count < max_retries:
+        download_file = os.path.join(tempfile.gettempdir(), f"orders_{uuid.uuid4().hex}.xlsx")
+        etag = None
+        
+        try:
+            # Download blob with ETag tracking
+            logging.info("Downloading Excel blob %s from container %s (attempt %d/%d)", 
+                        excel_blob_name, container_name, retry_count + 1, max_retries)
+            
+            try:
+                blob_data = blob_client.download_blob()
+                etag = blob_data.properties.etag
+                
+                with open(download_file, "wb") as f:
+                    f.write(blob_data.readall())
+                
+                wb = load_workbook(download_file)
+                ws = wb.active
+                
+            except Exception as ex:
+                # Blob doesn't exist - create new workbook
+                logging.warning("Creating new workbook because download failed: %s", ex)
+                wb = Workbook()
+                ws = wb.active
+                ws.append(["timestamp_utc", "customer_number", "item", "quantity"])
+                etag = None  # No ETag for new file
 
-    ws.append([datetime.utcnow().isoformat(), customer_number, order.get("item"), order.get("quantity")])
-    wb.save(download_file)
+            # Add the new order row
+            ws.append([
+                datetime.utcnow().isoformat(), 
+                customer_number, 
+                order.get("item"), 
+                order.get("quantity")
+            ])
+            wb.save(download_file)
 
-    with open(download_file, "rb") as data:
-        blob_client.upload_blob(data, overwrite=True)
-    logging.info("Uploaded updated Excel to blob %s", excel_blob_name)
-
-    try:
-        if os.path.exists(download_file):
-            os.remove(download_file)
-    except Exception:
-        logging.exception("Failed to cleanup excel temp file")
+            # Upload with optimistic concurrency control
+            with open(download_file, "rb") as data:
+                if etag:
+                    # Only upload if the blob hasn't changed (ETag matches)
+                    blob_client.upload_blob(
+                        data, 
+                        overwrite=True,
+                        etag=etag,
+                        match_condition=MatchConditions.IfNotModified
+                    )
+                else:
+                    # New file - upload without ETag check
+                    blob_client.upload_blob(data, overwrite=True)
+            
+            logging.info("Successfully uploaded updated Excel to blob %s", excel_blob_name)
+            
+            # Success - break out of retry loop
+            break
+            
+        except ResourceModifiedError:
+            # Race condition detected - another process modified the blob
+            retry_count += 1
+            logging.warning(
+                "Race condition detected: blob was modified by another process. "
+                "Retrying (%d/%d)...", retry_count, max_retries
+            )
+            
+            if retry_count >= max_retries:
+                logging.error("Failed to log order after %d retries due to race conditions", max_retries)
+                raise Exception(f"Failed to log order after {max_retries} retries due to concurrent modifications")
+            
+            # Exponential backoff before retry
+            import time
+            time.sleep(0.1 * (2 ** retry_count))  # 0.2s, 0.4s, 0.8s, 1.6s, 3.2s
+            
+        except Exception as ex:
+            logging.exception("Unexpected error while logging to Excel")
+            raise
+            
+        finally:
+            # Cleanup temp file
+            try:
+                if os.path.exists(download_file):
+                    os.remove(download_file)
+            except Exception:
+                logging.exception("Failed to cleanup excel temp file")
 
 # Optional Twilio confirmation
 def send_confirmation(to_number, order):

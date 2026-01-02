@@ -5,3 +5,4 @@ azure-storage-blob
 openai
 azure-cognitiveservices-speech
 twilio
+azure-core
