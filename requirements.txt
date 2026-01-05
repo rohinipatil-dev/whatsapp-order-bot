@@ -6,3 +6,4 @@ openai
 azure-cognitiveservices-speech
 twilio
 azure-core
+cryptography==43.0.3
