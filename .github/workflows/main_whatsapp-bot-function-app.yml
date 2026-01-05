@@ -40,6 +40,7 @@ jobs:
         with:
           name: python-app
           path: . # Upload the raw source code for deployment
+          include-hidden-files: true # To include .python_packages folder
 
   deploy:
     runs-on: ubuntu-latest
@@ -67,5 +68,5 @@ jobs:
         with:
           app-name: 'whatsapp-bot-function-app'
           package: '.' # Point to the root folder
-          scm-do-build-during-deployment: true
-          enable-oryx-build: true
+          scm-do-build-during-deployment: false
+          enable-oryx-build: false
