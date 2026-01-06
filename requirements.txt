@@ -2,10 +2,7 @@ azure-functions
 requests
 openpyxl
 azure-storage-blob
-openai
-azure-cognitiveservices-speech
+openai>=1.0.0
 twilio
 azure-core
 cryptography==43.0.3
-pydub
-ffmpeg-python

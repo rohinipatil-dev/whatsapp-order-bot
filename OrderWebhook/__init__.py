@@ -2,544 +2,191 @@ import logging
 import azure.functions as func
 import os
 import traceback
+import json
+from datetime import datetime
 
-logging.basicConfig(level=logging.INFO)
-logging.info("Module import started")
-
-# NOTE: This module expects the following environment variables to be set for full functionality:
-# - BLOB_CONN_STR, BLOB_CONTAINER, EXCEL_BLOB_NAME
-# - AZURE_SPEECH_KEY, AZURE_SPEECH_REGION        (for Azure Speech SDK transcription)
-# - AZURE_SPEECH_LANGUAGES (optional, comma-separated language tags like "ar-SA,en-US" for auto-detect)
-# - AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_KEY, AZURE_OPENAI_DEPLOYMENT (Azure OpenAI deployment name)
-# - TWILIO_SID, TWILIO_AUTH (for downloading Twilio-hosted media)
-#
-# If Speech SDK or OpenAI is not configured, code falls back to safer defaults (empty transcription or regex parse).
-# Be careful not to log secret values.
+# Configure logging to ensure it captures properly in Azure
+logger = logging.getLogger(__name__)
 
 def main(req: func.HttpRequest) -> func.HttpResponse:
     try:
-        import requests
-        from datetime import datetime
-        from urllib.parse import parse_qs, urlparse
-        import uuid
-        import tempfile
-        import json
-        import re
-
-        logging.info("WhatsApp voice webhook triggered.")
-
-        # Read required environment variables
+        # --- 1. CONFIGURATION GROUPING ---
+        # We read all environment variables at the start of the function
+        # This makes it easy to see what the function depends on
         BLOB_CONN_STR = os.environ.get("BLOB_CONN_STR")
         BLOB_CONTAINER = os.environ.get("BLOB_CONTAINER")
         EXCEL_BLOB_NAME = os.environ.get("EXCEL_BLOB_NAME")
 
-        # Azure Speech
-        AZURE_SPEECH_KEY = os.environ.get("AZURE_SPEECH_KEY")
-        AZURE_SPEECH_REGION = os.environ.get("AZURE_SPEECH_REGION")
-        AZURE_SPEECH_LANGUAGES = os.environ.get("AZURE_SPEECH_LANGUAGES")  # comma-separated list for auto-detect
+        OPENAI_ENDPOINT = os.environ.get("AZURE_OPENAI_ENDPOINT")
+        OPENAI_KEY = os.environ.get("AZURE_OPENAI_KEY")
+        WHISPER_DEPLOY = os.environ.get("AZURE_OPENAI_WHISPER_DEPLOYMENT")
+        GPT_DEPLOY = os.environ.get("AZURE_OPENAI_GPT_DEPLOYMENT")
 
-        # Azure OpenAI (these remain optional; parse_order will check)
-        AZURE_OPENAI_ENDPOINT = os.environ.get("AZURE_OPENAI_ENDPOINT")
-        AZURE_OPENAI_KEY = os.environ.get("AZURE_OPENAI_KEY")
-        AZURE_OPENAI_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT")
-
-        # Twilio
         TWILIO_SID = os.environ.get("TWILIO_SID")
         TWILIO_AUTH = os.environ.get("TWILIO_AUTH")
+        TWILIO_NUMBER = os.environ.get("TWILIO_WHATSAPP_NUMBER")
 
-        if not all([BLOB_CONN_STR, BLOB_CONTAINER, EXCEL_BLOB_NAME]):
-            logging.error("Missing one or more required storage environment variables (BLOB_CONN_STR, BLOB_CONTAINER, EXCEL_BLOB_NAME).")
-            return func.HttpResponse("Missing storage configuration", status_code=500)
+        # Imports grouped for speed and error isolation
+        from urllib.parse import parse_qs
+        import uuid
+        import tempfile
 
-        # Parse Twilio form or JSON
-        content_type = (req.headers.get("Content-Type") or req.headers.get("content-type") or "").lower()
-        form = {}
+        logging.info("--- Processing New WhatsApp Request ---")
+
+        # --- 2. VALIDATION ---
+        if not all([BLOB_CONN_STR, OPENAI_KEY, TWILIO_SID]):
+            logging.error("Missing critical environment variables. Check Azure App Settings.")
+            return func.HttpResponse("Server configuration error", status_code=500)
+
+        # --- 3. REQUEST PARSING ---
+        content_type = (req.headers.get("Content-Type") or "").lower()
         if "application/x-www-form-urlencoded" in content_type:
-            body = req.get_body().decode("utf-8", errors="replace")
-            parsed = parse_qs(body)
-            # parse_qs gives lists for each key
-            form = {k: v[0] if isinstance(v, list) and len(v) > 0 else "" for k, v in parsed.items()}
+            body = req.get_body().decode("utf-8")
+            form = {k: v[0] for k, v in parse_qs(body).items()}
         else:
-            # Try to read req.form if available or fallback to json
-            try:
-                if hasattr(req, "form"):
-                    form = {k: v for k, v in req.form.items()}
-                else:
-                    form = req.get_json() if req.get_body() else {}
-            except Exception:
-                # last fallback: parse empty
-                form = {}
+            form = req.get_json() if req.get_body() else {}
 
-        media_url = form.get("MediaUrl0") or form.get("MediaUrl") or ""
-        from_number = form.get("From") or ""
+        media_url = form.get("MediaUrl0") or form.get("MediaUrl")
+        from_number = form.get("From", "").replace("whatsapp:", "")
 
         if not media_url:
-            logging.warning("No media URL found in request")
-            return func.HttpResponse("No media found", status_code=400)
+            logging.warning(f"Request from {from_number} ignored: No MediaUrl found.")
+            return func.HttpResponse("Accepted", status_code=200)
 
-        # Step 2: Download voice file (to a temp file)
-        # Pass Twilio credentials so requests can authenticate when downloading Twilio-hosted media
-        voice_file_path = download_voice(media_url, twilio_sid=TWILIO_SID, twilio_auth=TWILIO_AUTH)
-
+        # --- 4. CORE LOGIC ---
+        logging.info(f"Downloading audio for customer: {from_number}")
+        voice_path = download_raw_voice(media_url, sid=TWILIO_SID, auth=TWILIO_AUTH)
+        
         try:
-            # Step 3: Upload to Azure Blob
-            blob_url = upload_to_blob(voice_file_path, BLOB_CONN_STR, BLOB_CONTAINER)
+            # Transcription (Whisper)
+            logging.info("Sending audio to Azure OpenAI Whisper...")
+            transcript = transcribe_whisper(voice_path, OPENAI_ENDPOINT, OPENAI_KEY, WHISPER_DEPLOY)
+            logging.info(f"Transcription result: {transcript}")
 
-            # Step 4: Transcribe: use Speech SDK if configured
-            speech_langs = None
-            if AZURE_SPEECH_LANGUAGES:
-                speech_langs = [l.strip() for l in AZURE_SPEECH_LANGUAGES.split(",") if l.strip()]
-            transcription = transcribe_audio(
-                blob_url,
-                conn_str=BLOB_CONN_STR,
-                speech_key=AZURE_SPEECH_KEY,
-                speech_region=AZURE_SPEECH_REGION,
-                auto_detect_languages=speech_langs
-            )
+            if not transcript.strip():
+                logging.error("Whisper returned empty text.")
+                return func.HttpResponse("Could not understand audio", status_code=200)
 
-            # Step 5: Parse using Azure OpenAI (via openai package) if configured else fallback regex
-            parsed_order = parse_order(
-                transcription,
-                openai_endpoint=AZURE_OPENAI_ENDPOINT,
-                openai_key=AZURE_OPENAI_KEY,
-                openai_deployment=AZURE_OPENAI_DEPLOYMENT
-            )
+            # Extraction (GPT)
+            logging.info("Extracting order details using GPT...")
+            order_data = extract_order_json(transcript, endpoint=OPENAI_ENDPOINT, key=OPENAI_KEY, deployment=GPT_DEPLOY)
+            logging.info(f"Structured Order: {json.dumps(order_data)}")
 
-            # Step 6: Log to Excel
-            log_to_excel(parsed_order, from_number, BLOB_CONN_STR, BLOB_CONTAINER, EXCEL_BLOB_NAME)
+            # Excel Logging
+            logging.info(f"Updating Excel sheet: {EXCEL_BLOB_NAME}")
+            log_to_excel(order_data, from_number, conn=BLOB_CONN_STR, container=BLOB_CONTAINER, blob=EXCEL_BLOB_NAME)
 
-            # Step 7: Optional: send confirmation (via Twilio API)
-            # send_confirmation(from_number, parsed_order)
+            # Customer Response
+            logging.info(f"Sending WhatsApp invoice to {from_number}")
+            invoice_msg = format_invoice(order_data)
+            send_whatsapp_message(from_number, invoice_msg, TWILIO_SID, TWILIO_AUTH, TWILIO_NUMBER)
+            
+            logging.info("--- Request Successfully Processed ---")
+            return func.HttpResponse(json.dumps({"status": "success"}), mimetype="application/json")
 
-            logging.info("Order processed successfully: %s", parsed_order)
-            return func.HttpResponse(json.dumps({"status": "ok", "order": parsed_order, "blob_url": blob_url}), status_code=200, mimetype="application/json")
         finally:
-            # Cleanup temp downloaded file
-            try:
-                if voice_file_path and os.path.exists(voice_file_path):
-                    os.remove(voice_file_path)
-            except Exception:
-                logging.exception("Failed to cleanup temp file")
+            # Always clean up the temp file even if the code crashes
+            if os.path.exists(voice_path):
+                os.remove(voice_path)
+                logging.info("Temporary audio file deleted.")
 
-    except Exception as e:
-        logging.exception("Unhandled error in WhatsApp webhook")
-        tb = traceback.format_exc()
-        # Put full traceback in logs (not in response) to avoid leaking secrets
-        logging.error("Traceback:\n%s", tb)
-        return func.HttpResponse("Internal server error", status_code=500)
+    except Exception:
+        # Log the full error for debugging in Application Insights
+        logging.error(f"CRITICAL ERROR: {traceback.format_exc()}")
+        return func.HttpResponse("Internal processing error", status_code=500)
 
+# ---------------- HELPER FUNCTIONS (Encapsulated) ----------------
 
-# ---------------- Helper functions ----------------
-
-def download_voice(media_url, twilio_sid=None, twilio_auth=None, timeout=30):
+def download_raw_voice(url, sid, auth):
     import requests
     import tempfile
     import uuid
-    from pydub import AudioSegment  # Required for conversion
-    from urllib.parse import urlparse
-
-    logging.info("Downloading media from %s", media_url)
-    auth = (twilio_sid, twilio_auth) if twilio_sid and twilio_auth else None
-    
-    # 1. Download the raw OGG file from Twilio
-    r = requests.get(media_url, stream=True, timeout=timeout, auth=auth)
+    r = requests.get(url, auth=(sid, auth), stream=True, timeout=30)
     r.raise_for_status()
-    
-    temp_dir = tempfile.gettempdir()
-    unique_id = uuid.uuid4().hex
-    # Use the actual extension from the URL if possible, default to .ogg
-    ext = os.path.splitext(urlparse(media_url).path)[1] or ".ogg"
-    raw_path = os.path.join(temp_dir, f"raw_{unique_id}{ext}")
-    wav_path = os.path.join(temp_dir, f"proc_{unique_id}.wav")
-
-    with open(raw_path, "wb") as f:
+    path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4().hex}.ogg")
+    with open(path, "wb") as f:
         for chunk in r.iter_content(chunk_size=8192):
             f.write(chunk)
+    return path
 
-    # 2. Convert OGG to WAV (Production standard for Speech SDK)
-    try:
-        logging.info("Attempting conversion to WAV (16kHz, Mono)...")
-        audio = AudioSegment.from_file(raw_path)
-        audio = audio.set_frame_rate(16000).set_channels(1).set_sample_width(2)
-        audio.export(wav_path, format="wav")
-        
-        # SUCCESS: We have a WAV. Now it is safe to delete the raw file.
-        if os.path.exists(raw_path):
-            os.remove(raw_path)
-            
-        logging.info("Conversion successful. Returning WAV: %s", wav_path)
-        return wav_path
+def transcribe_whisper(file_path, endpoint, key, deployment):
+    from openai import AzureOpenAI
+    client = AzureOpenAI(api_key=key, api_version="2024-06-01", azure_endpoint=endpoint)
+    with open(file_path, "rb") as audio:
+        result = client.audio.transcriptions.create(model=deployment, file=audio)
+    return result.text
 
-    except Exception as e:
-        # FAIL: Something went wrong with conversion (e.g., ffmpeg missing)
-        logging.error("Conversion failed. Returning raw file as fallback. Error: %s", e)
-        
-        # Ensure the WAV temp file is cleaned up if it was partially created
-        if os.path.exists(wav_path):
-            os.remove(wav_path)
-            
-        # Return the original raw file so the Speech SDK can at least try to read it
-        return raw_path
-
-
-def upload_to_blob(local_file, conn_str, container_name):
-    from azure.storage.blob import BlobServiceClient
-    from datetime import datetime
-    import uuid
-
-    blob_service_client = BlobServiceClient.from_connection_string(conn_str)
-    container_client = blob_service_client.get_container_client(container_name)
-    try:
-        container_client.create_container()
-        logging.info("Created container %s", container_name)
-    except Exception:
-        pass
-    blob_name = f"voices/{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex}{os.path.splitext(local_file)[1]}"
-    blob_client = container_client.get_blob_client(blob=blob_name)
-    logging.info("Uploading file %s to blob %s", local_file, blob_name)
-    with open(local_file, "rb") as data:
-        blob_client.upload_blob(data, overwrite=True)
-    logging.info("Uploaded blob url: %s", blob_client.url)
-    return blob_client.url
-
-
-def transcribe_audio(blob_url, conn_str=None, speech_key=None, speech_region=None, auto_detect_languages=None):
-    # Imports moved inside for better cold-start performance and error isolation
-    import tempfile
-    import uuid
-    import requests
-    from urllib.parse import urlparse
-    from azure.storage.blob import BlobServiceClient
-    from pydub import AudioSegment
+def extract_order_json(text, endpoint, key, deployment):
+    from openai import AzureOpenAI
+    client = AzureOpenAI(api_key=key, api_version="2024-02-15-preview", azure_endpoint=endpoint)
     
-    logging.info("Starting transcription process for: %s", blob_url)
-    
-    raw_download_path = None
-    processed_wav_path = None
-
-    try:
-        temp_dir = tempfile.gettempdir()
-        unique_id = uuid.uuid4().hex
-        
-        # 1. DOWNLOAD THE FILE
-        if conn_str:
-            parsed = urlparse(blob_url)
-            path = parsed.path.lstrip("/")
-            parts = path.split("/", 1)
-            if len(parts) != 2:
-                raise ValueError("Unable to parse container/blob from blob_url")
-            container_name, blob_name = parts[0], parts[1]
-            
-            blob_client = BlobServiceClient.from_connection_string(conn_str).get_blob_client(container=container_name, blob=blob_name)
-            suffix = os.path.splitext(blob_name)[1] or ".ogg"
-            raw_download_path = os.path.join(temp_dir, f"raw_{unique_id}{suffix}")
-            
-            with open(raw_download_path, "wb") as f:
-                f.write(blob_client.download_blob().readall())
-        else:
-            r = requests.get(blob_url, stream=True, timeout=60)
-            r.raise_for_status()
-            suffix = os.path.splitext(urlparse(blob_url).path)[1] or ".ogg"
-            raw_download_path = os.path.join(temp_dir, f"raw_{unique_id}{suffix}")
-            with open(raw_download_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    f.write(chunk)
-
-        # 2. CONVERT TO PRODUCTION-READY WAV (16kHz, Mono, 16-bit PCM)
-        processed_wav_path = os.path.join(temp_dir, f"proc_{unique_id}.wav")
-        try:
-            logging.info("Converting %s to standardized WAV...", suffix)
-            audio = AudioSegment.from_file(raw_download_path)
-            # Standardizing to 16kHz, Mono, 16-bit PCM (sample_width=2)
-            audio = audio.set_frame_rate(16000).set_channels(1).set_sample_width(2)
-            audio.export(processed_wav_path, format="wav")
-            audio_input_path = processed_wav_path
-        except Exception as e:
-            logging.error("Conversion failed, attempting to use raw file: %s", e)
-            audio_input_path = raw_download_path
-
-        # 3. SPEECH SDK TRANSCRIPTION
-        if speech_key and speech_region:
-            import azure.cognitiveservices.speech as speechsdk
-            
-            speech_config = speechsdk.SpeechConfig(subscription=speech_key, region=speech_region)
-            audio_config = speechsdk.audio.AudioConfig(filename=audio_input_path)
-
-            if auto_detect_languages and isinstance(auto_detect_languages, (list, tuple)):
-                auto_detect_config = speechsdk.AutoDetectSourceLanguageConfig(languages=auto_detect_languages)
-                recognizer = speechsdk.SpeechRecognizer(
-                    speech_config=speech_config, 
-                    audio_config=audio_config, 
-                    auto_detect_source_language_config=auto_detect_config
-                )
-            else:
-                recognizer = speechsdk.SpeechRecognizer(speech_config=speech_config, audio_config=audio_config)
-
-            result = recognizer.recognize_once()
-
-            if result.reason == speechsdk.ResultReason.RecognizedSpeech:
-                logging.info("Transcription Successful.")
-                return result.text
-            elif result.reason == speechsdk.ResultReason.NoMatch:
-                logging.warning("No speech recognized.")
-            else:
-                logging.warning("Speech SDK Error: %s", result.reason)
-        
-        return ""
-
-    except Exception as e:
-        logging.exception("Error in transcribe_audio: %s", e)
-        return ""
-        
-    finally:
-        # 4. CLEANUP BOTH FILES
-        for path in [raw_download_path, processed_wav_path]:
-            if path and os.path.exists(path):
-                try:
-                    os.remove(path)
-                except Exception:
-                    pass
-
-
-def parse_order(transcribed_text, openai_endpoint=None, openai_key=None, openai_deployment=None):
-    """
-    Parse transcribed_text into {'quantity': int|None, 'item': str|None}.
-    - If Azure OpenAI config provided, uses the openai package configured for Azure.
-    - Otherwise falls back to a regex parser.
-    """
-    import json
-    import re
-
-    logging.info("Parsing transcription: %s", transcribed_text)
-
-    # Try Azure OpenAI via openai package if configured
-    if openai_endpoint and openai_key and openai_deployment:
-        try:
-            try:
-                from openai import AzureOpenAI
-            except ImportError:
-                logging.warning("openai package is not installed; falling back to regex parser.")
-                raise
-
-            # Initialize Azure OpenAI client (modern SDK v1.0+)
-            client = AzureOpenAI(
-                azure_endpoint=openai_endpoint.rstrip("/"),
-                api_key=openai_key,
-                api_version="2024-02-15-preview"  # Use latest stable API version
-            )
-
-            system_msg = {
-                "role": "system",
-                "content": "You are a precise JSON generator. Respond with ONLY a single JSON object with keys: 'quantity' (integer or null) and 'item' (string or null). Respond with valid JSON only, no additional text."
-            }
-            user_msg = {
-                "role": "user",
-                "content": f"Extract quantity and item from this customer transcription: \"{transcribed_text}\". Example: {{\"quantity\": 3, \"item\": \"bottles\"}}"
-            }
-
-            # Use new API format
-            response = client.chat.completions.create(
-                model=openai_deployment,
-                messages=[system_msg, user_msg],
-                max_tokens=80,
-                temperature=0
-            )
-
-            # Extract content from response
-            content = ""
-            try:
-                content = response.choices[0].message.content
-            except Exception as e:
-                logging.warning("Failed to extract content from OpenAI response: %s", e)
-                content = str(response)
-
-            # Try parsing full content as JSON first
-            obj = None
-            try:
-                obj = json.loads(content)
-            except json.JSONDecodeError:
-                # fallback: try to extract first {...} substring
-                m = re.search(r"\{.*\}", content, re.DOTALL)
-                if m:
-                    try:
-                        obj = json.loads(m.group(0))
-                    except Exception:
-                        logging.debug("Failed to json.loads extracted substring from OpenAI content.")
-                        obj = None
-                else:
-                    logging.debug("OpenAI response did not contain a JSON object.")
-
-            if obj:
-                qty = obj.get("quantity")
-                try:
-                    qty = int(qty) if qty is not None else None
-                except Exception:
-                    qty = None
-                item = obj.get("item")
-                if isinstance(item, str):
-                    item = item.strip().lower()
-                return {"quantity": qty, "item": item}
-            else:
-                logging.warning("OpenAI response could not be parsed as JSON; falling back to regex parser.")
-        except Exception:
-            logging.exception("Azure OpenAI (openai package) parse failed; falling back to regex parser.")
-
-    # Fallback regex-based parser
-    try:
-        # Match digits followed by item name
-        m = re.search(r"(\d+)\s+([A-Za-z\u0600-\u06FF][\w\u0600-\u06FF\s-]*)", transcribed_text, re.UNICODE)
-        if m:
-            return {"quantity": int(m.group(1)), "item": m.group(2).strip().lower()}
-        
-        # Match spelled-out numbers (basic)
-        words_to_num = {
-            "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
-            "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10
-        }
-        m2 = re.search(
-            r"\b(" + "|".join(words_to_num.keys()) + r")\b\s+([A-Za-z\u0600-\u06FF][\w\u0600-\u06FF\s-]*)",
-            transcribed_text,
-            re.IGNORECASE
-        )
-        if m2:
-            return {
-                "quantity": words_to_num.get(m2.group(1).lower()),
-                "item": m2.group(2).strip().lower()
-            }
-    except Exception:
-        logging.exception("Regex parsing failed")
-
-    return {"quantity": None, "item": None}
-
-
-def log_to_excel(order, customer_number, conn_str, container_name, excel_blob_name, max_retries=5):
-    """
-    Log order to Excel with optimistic concurrency control to prevent race conditions.
-    Uses ETag-based locking to ensure no data is lost when multiple requests arrive simultaneously.
-    
-    Args:
-        order: Dict with 'item' and 'quantity'
-        customer_number: Customer's phone number
-        conn_str: Azure Storage connection string
-        container_name: Blob container name
-        excel_blob_name: Name of the Excel blob
-        max_retries: Maximum number of retry attempts on conflicts (default: 5)
-    """
-    from azure.storage.blob import BlobServiceClient
-    from openpyxl import Workbook, load_workbook
-    from azure.core import MatchConditions
-    from azure.core.exceptions import ResourceModifiedError
-    import tempfile
-    import uuid
-    from datetime import datetime
-
-    logging.info("Logging order to Excel: %s", order)
-    blob_service_client = BlobServiceClient.from_connection_string(conn_str)
-    container_client = blob_service_client.get_container_client(container_name)
-    blob_client = container_client.get_blob_client(excel_blob_name)
-
-    retry_count = 0
-    
-    while retry_count < max_retries:
-        download_file = os.path.join(tempfile.gettempdir(), f"orders_{uuid.uuid4().hex}.xlsx")
-        etag = None
-        
-        try:
-            # Download blob with ETag tracking
-            logging.info("Downloading Excel blob %s from container %s (attempt %d/%d)", 
-                        excel_blob_name, container_name, retry_count + 1, max_retries)
-            
-            try:
-                blob_data = blob_client.download_blob()
-                etag = blob_data.properties.etag
-                
-                with open(download_file, "wb") as f:
-                    f.write(blob_data.readall())
-                
-                wb = load_workbook(download_file)
-                ws = wb.active
-                
-            except Exception as ex:
-                # Blob doesn't exist - create new workbook
-                logging.warning("Creating new workbook because download failed: %s", ex)
-                wb = Workbook()
-                ws = wb.active
-                ws.append(["timestamp_utc", "customer_number", "item", "quantity"])
-                etag = None  # No ETag for new file
-
-            # Add the new order row
-            ws.append([
-                datetime.utcnow().isoformat(), 
-                customer_number, 
-                order.get("item"), 
-                order.get("quantity")
-            ])
-            wb.save(download_file)
-
-            # Upload with optimistic concurrency control
-            with open(download_file, "rb") as data:
-                if etag:
-                    # Only upload if the blob hasn't changed (ETag matches)
-                    blob_client.upload_blob(
-                        data, 
-                        overwrite=True,
-                        etag=etag,
-                        match_condition=MatchConditions.IfNotModified
-                    )
-                else:
-                    # New file - upload without ETag check
-                    blob_client.upload_blob(data, overwrite=True)
-            
-            logging.info("Successfully uploaded updated Excel to blob %s", excel_blob_name)
-            
-            # Success - break out of retry loop
-            break
-            
-        except ResourceModifiedError:
-            # Race condition detected - another process modified the blob
-            retry_count += 1
-            logging.warning(
-                "Race condition detected: blob was modified by another process. "
-                "Retrying (%d/%d)...", retry_count, max_retries
-            )
-            
-            if retry_count >= max_retries:
-                logging.error("Failed to log order after %d retries due to race conditions", max_retries)
-                raise Exception(f"Failed to log order after {max_retries} retries due to concurrent modifications")
-            
-            # Exponential backoff before retry
-            import time
-            time.sleep(0.1 * (2 ** retry_count))  # 0.2s, 0.4s, 0.8s, 1.6s, 3.2s
-            
-        except Exception as ex:
-            logging.exception("Unexpected error while logging to Excel")
-            raise
-            
-        finally:
-            # Cleanup temp file
-            try:
-                if os.path.exists(download_file):
-                    os.remove(download_file)
-            except Exception:
-                logging.exception("Failed to cleanup excel temp file")
-
-# Optional Twilio confirmation
-def send_confirmation(to_number, order):
-    from twilio.rest import Client
-    TWILIO_SID = os.environ.get("TWILIO_SID")
-    TWILIO_AUTH = os.environ.get("TWILIO_AUTH")
-    TWILIO_WHATSAPP = os.environ.get("TWILIO_WHATSAPP_NUMBER")
-
-    if not all([TWILIO_SID, TWILIO_AUTH, TWILIO_WHATSAPP]):
-        logging.warning("Twilio config incomplete; skipping confirmation message.")
-        return
-
-    client = Client(TWILIO_SID, TWILIO_AUTH)
-    qty = order.get("quantity") or ""
-    item = order.get("item") or ""
-    message = f"Your order of {qty} {item} has been logged."
-    client.messages.create(
-        body=message,
-        from_=f"whatsapp:{TWILIO_WHATSAPP}",
-        to=f"whatsapp:{to_number}"
+    # Precise prompt to ensure GPT doesn't add conversational filler
+    prompt = (
+        f"Extract order from: '{text}'. "
+        "Return ONLY valid JSON with structure: "
+        "{'items': [{'name':str, 'qty':int, 'price':int}], 'total':int, 'currency':str}"
     )
+    
+    response = client.chat.completions.create(
+        model=deployment,
+        messages=[
+            {"role": "system", "content": "You are a JSON-only order processing bot."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0
+    )
+    # Parse the text response into a Python dictionary
+    return json.loads(response.choices[0].message.content)
+
+def format_invoice(data):
+    """Formats a user-friendly WhatsApp message with Markdown bolding."""
+    msg = "✅ *Order Confirmed*\n---\n"
+    for item in data.get('items', []):
+        name = item.get('name', 'Item')
+        qty = item.get('qty', 1)
+        price = item.get('price', 0)
+        msg += f"• {name} (x{qty}): {qty * price} {data.get('currency', '')}\n"
+    msg += f"\n*Total Amount: {data.get('total', 0)} {data.get('currency', '')}*"
+    msg += "\n\nWe are preparing your order now!"
+    return msg
+
+def send_whatsapp_message(to, body, sid, auth, from_num):
+    from twilio.rest import Client
+    Client(sid, auth).messages.create(
+        body=body, 
+        from_=f"whatsapp:{from_num}", 
+        to=f"whatsapp:{to}"
+    )
+
+def log_to_excel(data, customer, conn, container, blob):
+    from azure.storage.blob import BlobServiceClient
+    from openpyxl import load_workbook, Workbook
+    import tempfile
+    
+    service = BlobServiceClient.from_connection_string(conn)
+    b_client = service.get_blob_client(container, blob)
+    tmp = os.path.join(tempfile.gettempdir(), f"sync_{customer}.xlsx")
+    
+    # Download existing or create new
+    try:
+        with open(tmp, "wb") as f: 
+            f.write(b_client.download_blob().readall())
+        wb = load_workbook(tmp)
+    except Exception:
+        wb = Workbook()
+        wb.active.append(["Date", "Customer", "Items", "Total"])
+    
+    ws = wb.active
+    # Create a string summary of items for the Excel cell
+    summary = ", ".join([f"{i['name']} x{i['qty']}" for i in data.get('items', [])])
+    
+    ws.append([
+        datetime.utcnow().strftime("%Y-%m-%d %H:%M"), 
+        customer, 
+        summary, 
+        data.get('total')
+    ])
+    
+    wb.save(tmp)
+    with open(tmp, "rb") as f: 
+        b_client.upload_blob(f, overwrite=True)
