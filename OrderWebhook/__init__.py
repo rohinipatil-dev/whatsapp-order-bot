@@ -135,20 +135,51 @@ def download_voice(media_url, twilio_sid=None, twilio_auth=None, timeout=30):
     import requests
     import tempfile
     import uuid
+    from pydub import AudioSegment  # Required for conversion
     from urllib.parse import urlparse
 
     logging.info("Downloading media from %s", media_url)
     auth = (twilio_sid, twilio_auth) if twilio_sid and twilio_auth else None
+    
+    # 1. Download the raw OGG file from Twilio
     r = requests.get(media_url, stream=True, timeout=timeout, auth=auth)
     r.raise_for_status()
-    suffix = os.path.splitext(urlparse(media_url).path)[1] or ".ogg"
-    filename = os.path.join(tempfile.gettempdir(), f"temp_voice_{uuid.uuid4().hex}{suffix}")
-    with open(filename, "wb") as f:
+    
+    temp_dir = tempfile.gettempdir()
+    unique_id = uuid.uuid4().hex
+    # Use the actual extension from the URL if possible, default to .ogg
+    ext = os.path.splitext(urlparse(media_url).path)[1] or ".ogg"
+    raw_path = os.path.join(temp_dir, f"raw_{unique_id}{ext}")
+    wav_path = os.path.join(temp_dir, f"proc_{unique_id}.wav")
+
+    with open(raw_path, "wb") as f:
         for chunk in r.iter_content(chunk_size=8192):
-            if chunk:
-                f.write(chunk)
-    logging.info("Downloaded media to %s", filename)
-    return filename
+            f.write(chunk)
+
+    # 2. Convert OGG to WAV (Production standard for Speech SDK)
+    try:
+        logging.info("Attempting conversion to WAV (16kHz, Mono)...")
+        audio = AudioSegment.from_file(raw_path)
+        audio = audio.set_frame_rate(16000).set_channels(1).set_sample_width(2)
+        audio.export(wav_path, format="wav")
+        
+        # SUCCESS: We have a WAV. Now it is safe to delete the raw file.
+        if os.path.exists(raw_path):
+            os.remove(raw_path)
+            
+        logging.info("Conversion successful. Returning WAV: %s", wav_path)
+        return wav_path
+
+    except Exception as e:
+        # FAIL: Something went wrong with conversion (e.g., ffmpeg missing)
+        logging.error("Conversion failed. Returning raw file as fallback. Error: %s", e)
+        
+        # Ensure the WAV temp file is cleaned up if it was partially created
+        if os.path.exists(wav_path):
+            os.remove(wav_path)
+            
+        # Return the original raw file so the Speech SDK can at least try to read it
+        return raw_path
 
 
 def upload_to_blob(local_file, conn_str, container_name):
@@ -173,15 +204,24 @@ def upload_to_blob(local_file, conn_str, container_name):
 
 
 def transcribe_audio(blob_url, conn_str=None, speech_key=None, speech_region=None, auto_detect_languages=None):
+    # Imports moved inside for better cold-start performance and error isolation
     import tempfile
     import uuid
     import requests
     from urllib.parse import urlparse
     from azure.storage.blob import BlobServiceClient
+    from pydub import AudioSegment
+    
+    logging.info("Starting transcription process for: %s", blob_url)
+    
+    raw_download_path = None
+    processed_wav_path = None
 
-    logging.info("Transcribing audio at %s", blob_url)
-    download_path = None
     try:
+        temp_dir = tempfile.gettempdir()
+        unique_id = uuid.uuid4().hex
+        
+        # 1. DOWNLOAD THE FILE
         if conn_str:
             parsed = urlparse(blob_url)
             path = parsed.path.lstrip("/")
@@ -189,68 +229,76 @@ def transcribe_audio(blob_url, conn_str=None, speech_key=None, speech_region=Non
             if len(parts) != 2:
                 raise ValueError("Unable to parse container/blob from blob_url")
             container_name, blob_name = parts[0], parts[1]
+            
             blob_client = BlobServiceClient.from_connection_string(conn_str).get_blob_client(container=container_name, blob=blob_name)
-            download_path = os.path.join(tempfile.gettempdir(), f"speech_{uuid.uuid4().hex}{os.path.splitext(blob_name)[1] or '.wav'}")
-            with open(download_path, "wb") as f:
-                stream = blob_client.download_blob()
-                f.write(stream.readall())
+            suffix = os.path.splitext(blob_name)[1] or ".ogg"
+            raw_download_path = os.path.join(temp_dir, f"raw_{unique_id}{suffix}")
+            
+            with open(raw_download_path, "wb") as f:
+                f.write(blob_client.download_blob().readall())
         else:
             r = requests.get(blob_url, stream=True, timeout=60)
             r.raise_for_status()
             suffix = os.path.splitext(urlparse(blob_url).path)[1] or ".ogg"
-            download_path = os.path.join(tempfile.gettempdir(), f"speech_{uuid.uuid4().hex}{suffix}")
-            with open(download_path, "wb") as f:
+            raw_download_path = os.path.join(temp_dir, f"raw_{unique_id}{suffix}")
+            with open(raw_download_path, "wb") as f:
                 for chunk in r.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
+                    f.write(chunk)
 
-        # Use Speech SDK if possible
+        # 2. CONVERT TO PRODUCTION-READY WAV (16kHz, Mono, 16-bit PCM)
+        processed_wav_path = os.path.join(temp_dir, f"proc_{unique_id}.wav")
+        try:
+            logging.info("Converting %s to standardized WAV...", suffix)
+            audio = AudioSegment.from_file(raw_download_path)
+            # Standardizing to 16kHz, Mono, 16-bit PCM (sample_width=2)
+            audio = audio.set_frame_rate(16000).set_channels(1).set_sample_width(2)
+            audio.export(processed_wav_path, format="wav")
+            audio_input_path = processed_wav_path
+        except Exception as e:
+            logging.error("Conversion failed, attempting to use raw file: %s", e)
+            audio_input_path = raw_download_path
+
+        # 3. SPEECH SDK TRANSCRIPTION
         if speech_key and speech_region:
-            try:
-                import azure.cognitiveservices.speech as speechsdk
-            except Exception as e:
-                logging.exception("Speech SDK import failed. Ensure azure-cognitiveservices-speech is installed. Error: %s", e)
-                return ""
-
+            import azure.cognitiveservices.speech as speechsdk
+            
             speech_config = speechsdk.SpeechConfig(subscription=speech_key, region=speech_region)
-            audio_config = speechsdk.AudioConfig(filename=download_path)
+            audio_config = speechsdk.audio.AudioConfig(filename=audio_input_path)
 
-            if auto_detect_languages and isinstance(auto_detect_languages, (list, tuple)) and len(auto_detect_languages) > 0:
-                try:
-                    auto_detect_config = speechsdk.AutoDetectSourceLanguageConfig(languages=auto_detect_languages)
-                    recognizer = speechsdk.SpeechRecognizer(speech_config=speech_config, audio_config=audio_config, auto_detect_source_language_config=auto_detect_config)
-                    result = recognizer.recognize_once()
-                    try:
-                        detection = result.properties.get(speechsdk.PropertyId.SpeechServiceConnection_AutoDetectSourceLanguageResult)
-                        logging.info("Auto-detected language result: %s", detection)
-                    except Exception:
-                        pass
-                except Exception:
-                    logging.exception("Auto-detect language failed; falling back to single-language recognition")
-                    recognizer = speechsdk.SpeechRecognizer(speech_config=speech_config, audio_config=audio_config)
-                    result = recognizer.recognize_once()
+            if auto_detect_languages and isinstance(auto_detect_languages, (list, tuple)):
+                auto_detect_config = speechsdk.AutoDetectSourceLanguageConfig(languages=auto_detect_languages)
+                recognizer = speechsdk.SpeechRecognizer(
+                    speech_config=speech_config, 
+                    audio_config=audio_config, 
+                    auto_detect_source_language_config=auto_detect_config
+                )
             else:
                 recognizer = speechsdk.SpeechRecognizer(speech_config=speech_config, audio_config=audio_config)
-                result = recognizer.recognize_once()
+
+            result = recognizer.recognize_once()
 
             if result.reason == speechsdk.ResultReason.RecognizedSpeech:
-                logging.info("Transcription success (length %d): %s", len(result.text or ""), (result.text or ""))
-                return result.text or ""
+                logging.info("Transcription Successful.")
+                return result.text
             elif result.reason == speechsdk.ResultReason.NoMatch:
-                logging.warning("No speech could be recognized.")
-                return ""
+                logging.warning("No speech recognized.")
             else:
-                logging.warning("Speech recognition failed or canceled: %s", result.reason)
-                return ""
-        else:
-            logging.warning("Speech key/region not set; skipping speech SDK transcription.")
-            return ""
+                logging.warning("Speech SDK Error: %s", result.reason)
+        
+        return ""
+
+    except Exception as e:
+        logging.exception("Error in transcribe_audio: %s", e)
+        return ""
+        
     finally:
-        try:
-            if download_path and os.path.exists(download_path):
-                os.remove(download_path)
-        except Exception:
-            logging.exception("Failed to remove temp transcription file")
+        # 4. CLEANUP BOTH FILES
+        for path in [raw_download_path, processed_wav_path]:
+            if path and os.path.exists(path):
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
 
 
 def parse_order(transcribed_text, openai_endpoint=None, openai_key=None, openai_deployment=None):
