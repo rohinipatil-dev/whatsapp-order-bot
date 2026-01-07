@@ -152,23 +152,36 @@ def format_invoice(data):
 
 def send_whatsapp_message(to, body, sid, auth, from_num):
     from twilio.rest import Client
-    
-    # 1. Clean the 'from' number (Remove any whitespace/newlines)
-    # The sandbox MUST be 'whatsapp:+14155238886'
+
+    # 1. Clean and prefix the 'from' number
     sender = from_num.strip()
-    # 2. Clean the 'to' number
-    # Twilio Webhooks usually send 'whatsapp:+971...' - we keep that format
+    if not sender.startswith("whatsapp:"):
+        sender = f"whatsapp:{sender}"
+    
+    # 2. Clean and prefix the 'to' number
     recipient = to.strip()
+    if not recipient.startswith("whatsapp:"):
+        recipient = f"whatsapp:{recipient}"
+
+    # --- LOGGING THE ATTEMPT ---
+    logging.info("--- TWILIO OUTBOUND LOG ---")
+    logging.info(f"SENDER:    [{sender}]")
+    logging.info(f"RECIPIENT: [{recipient}]")
+    logging.info(f"MESSAGE:   {body[:50]}...") # Logs first 50 chars of the message
+    
     client = Client(sid, auth)
+    
     try:
         message = client.messages.create(
             body=body,
-            from_=sender,  # Note the underscore!
+            from_=sender,
             to=recipient
         )
+        logging.info(f"SUCCESS: Message SID {message.sid}")
         return message.sid
     except Exception as e:
-        print(f"Twilio Error Details: {str(e)}")
+        # Logs the specific error from Twilio
+        logging.error(f"TWILIO FAILURE: {str(e)}")
         raise e
 
 def log_to_excel(data, customer, conn, container, blob):
