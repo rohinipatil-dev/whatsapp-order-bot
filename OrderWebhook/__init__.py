@@ -152,11 +152,24 @@ def format_invoice(data):
 
 def send_whatsapp_message(to, body, sid, auth, from_num):
     from twilio.rest import Client
-    Client(sid, auth).messages.create(
-        body=body, 
-        from_=f"whatsapp:{from_num}", 
-        to=f"whatsapp:{to}"
-    )
+    
+    # 1. Clean the 'from' number (Remove any whitespace/newlines)
+    # The sandbox MUST be 'whatsapp:+14155238886'
+    sender = from_num.strip()
+    # 2. Clean the 'to' number
+    # Twilio Webhooks usually send 'whatsapp:+971...' - we keep that format
+    recipient = to.strip()
+    client = Client(sid, auth)
+    try:
+        message = client.messages.create(
+            body=body,
+            from_=sender,  # Note the underscore!
+            to=recipient
+        )
+        return message.sid
+    except Exception as e:
+        print(f"Twilio Error Details: {str(e)}")
+        raise e
 
 def log_to_excel(data, customer, conn, container, blob):
     from azure.storage.blob import BlobServiceClient
