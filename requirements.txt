@@ -6,3 +6,6 @@ openai>=1.0.0
 twilio
 azure-core
 cryptography==43.0.3
+pandas
+openpyxl
+pymupdf4llm

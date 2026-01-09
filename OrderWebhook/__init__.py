@@ -16,6 +16,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         BLOB_CONN_STR = os.environ.get("BLOB_CONN_STR")
         BLOB_CONTAINER = os.environ.get("BLOB_CONTAINER")
         EXCEL_BLOB_NAME = os.environ.get("EXCEL_BLOB_NAME")
+        CATALOG_BLOB_NAME = os.environ.get("CATALOG_BLOB_NAME")
 
         OPENAI_ENDPOINT = os.environ.get("AZURE_OPENAI_ENDPOINT")
         OPENAI_KEY = os.environ.get("AZURE_OPENAI_KEY")
@@ -67,16 +68,30 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                 logging.error("Whisper returned empty text.")
                 return func.HttpResponse("Could not understand audio", status_code=200)
 
-            # Extraction (GPT)
-            logging.info("Extracting order details using GPT...")
-            order_data = extract_order_json(transcript, endpoint=OPENAI_ENDPOINT, key=OPENAI_KEY, deployment=GPT_DEPLOY)
-            logging.info(f"Structured Order: {json.dumps(order_data)}")
+            # Catalog Context Loading
+            logging.info("Loading product catalog for context...")
+            catalog_content = get_catalog_context(BLOB_CONN_STR, BLOB_CONTAINER, CATALOG_BLOB_NAME)
 
-            # Excel Logging
+            # AI matching and Extraction (GPT)
+            # We pass the catalog directly into the prompt context
+            logging.info("Extracting order details using catalog and GPT...")
+            order_data = extract_order_with_pricing(
+                transcript, 
+                catalog_content, 
+                OPENAI_ENDPOINT, 
+                OPENAI_KEY, 
+                GPT_DEPLOY
+            )
+            # Log the matches for debugging
+            for item in order_data.get('items', []):
+                status = "✅" if item.get('price_found') else "❌ NOT IN CATALOG"
+                logging.info(f"{status} {item['name']} - {item.get('unit_price', 0)} AED")
+
+            # Save to Order Log (Excel)
             logging.info(f"Updating Excel sheet: {EXCEL_BLOB_NAME}")
             log_to_excel(order_data, from_number, conn=BLOB_CONN_STR, container=BLOB_CONTAINER, blob=EXCEL_BLOB_NAME)
 
-            # Customer Response
+            # Send WhatsApp invoice to customer
             logging.info(f"Sending WhatsApp invoice to {from_number}")
             invoice_msg = format_invoice(order_data)
             send_whatsapp_message(from_number, invoice_msg, TWILIO_SID, TWILIO_AUTH, TWILIO_NUMBER)
@@ -116,24 +131,29 @@ def transcribe_whisper(file_path, endpoint, key, deployment):
         result = client.audio.transcriptions.create(model=deployment, file=audio)
     return result.text
 
-def extract_order_json(text, endpoint, key, deployment):
+def extract_order_with_pricing(transcript, catalog, endpoint, key, deployment):
+    """Uses GPT-4o-mini to match transcript against catalog."""
     from openai import AzureOpenAI
     client = AzureOpenAI(api_key=key, api_version="2024-02-15-preview", azure_endpoint=endpoint)
     
     # Precise prompt to ensure GPT doesn't add conversational filler
-    prompt = (
-        f"Extract order from: '{text}'. "
-        "Return ONLY valid JSON with structure: "
-        "{'items': [{'name':str, 'qty':int, 'price':int}], 'total':int, 'currency':str}"
-    )
+    prompt = f"""
+    Use this Catalog:
+    {catalog}
+    
+    Task: Extract items from this message: "{transcript}"
+    Rules:
+    1. Fuzzy match names to the catalog.
+    2. If matched, provide 'unit_price' and set 'price_found' true.
+    3. If not matched, set 'unit_price' 0 and 'price_found' false.
+    4. Calculate 'total' as qty * unit_price.
+    Return JSON format: {{"items": [{{"name": str, "qty": float, "unit_price": float, "total": float, "price_found": bool}}]}}
+    """
     
     response = client.chat.completions.create(
         model=deployment,
-        messages=[
-            {"role": "system", "content": "You are a JSON-only order processing bot."},
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0
+        messages=[{"role": "system", "content": prompt}],
+        response_format={"type": "json_object"}
     )
     # Parse the text response into a Python dictionary
     return json.loads(response.choices[0].message.content)
@@ -216,3 +236,35 @@ def log_to_excel(data, customer, conn, container, blob):
     wb.save(tmp)
     with open(tmp, "rb") as f: 
         b_client.upload_blob(f, overwrite=True)
+
+def get_catalog_context(conn_str, container, blob_name):
+    import pandas as pd
+    import pymupdf4llm
+    import io
+    from azure.storage.blob import BlobServiceClient
+    logging.info(f"--- Loading Catalog: {blob_name} ---")
+    
+    try:
+        service_client = BlobServiceClient.from_connection_string(conn_str)
+        blob_client = service_client.get_blob_client(container=container, blob=blob_name)
+        
+        blob_data = blob_client.download_blob().readall()
+        ext = blob_name.split('.')[-1].lower()
+
+        if ext in ['xlsx', 'xls']:
+            df = pd.read_excel(io.BytesIO(blob_data))
+            logging.info(f"Excel loaded: {len(df)} items found.")
+            return df.to_csv(index=False, sep="|") # CSV is token-efficient for GPT
+            
+        elif ext == 'pdf':
+            # PyMuPDF4LLM is great for converting PDF tables to Markdown
+            with open("/tmp/catalog.pdf", "wb") as f:
+                f.write(blob_data)
+            md_text = pymupdf4llm.to_markdown("/tmp/catalog.pdf")
+            logging.info(f"PDF converted to Markdown. Length: {len(md_text)}")
+            return md_text
+            
+        return "Warning: Unsupported catalog format."
+    except Exception as e:
+        logging.error(f"Catalog Load Error: {str(e)}")
+        return "No catalog data available."
