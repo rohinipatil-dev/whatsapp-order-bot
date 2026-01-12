@@ -251,7 +251,7 @@ def get_catalog_context(conn_str, container, blob_name):
         blob_data = blob_client.download_blob().readall()
         ext = blob_name.split('.')[-1].lower()
 
-        if ext in ['xlsx', 'xls']:
+        if ext in ['xlsx', 'xls', 'xlsb']:
             df = pd.read_excel(io.BytesIO(blob_data))
             logging.info(f"Excel loaded: {len(df)} items found.")
             return df.to_csv(index=False, sep="|") # CSV is token-efficient for GPT
