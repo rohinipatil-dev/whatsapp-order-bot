@@ -132,42 +132,86 @@ def transcribe_whisper(file_path, endpoint, key, deployment):
     return result.text
 
 def extract_order_with_pricing(transcript, catalog, endpoint, key, deployment):
-    """Uses GPT-4o-mini to match transcript against catalog."""
+    """Uses GPT-4o-mini to match transcript against catalog with status flags."""
     from openai import AzureOpenAI
     client = AzureOpenAI(api_key=key, api_version="2024-02-15-preview", azure_endpoint=endpoint)
     
-    # Precise prompt to ensure GPT doesn't add conversational filler
+    logging.info(f"--- 🤖 GPT EXTRACTION STARTING ---")
+    
     prompt = f"""
-    Use this Catalog:
+    CATALOG DATA (Pipe-Separated):
     {catalog}
     
-    Task: Extract items from this message: "{transcript}"
-    Rules:
-    1. Fuzzy match names to the catalog.
-    2. If matched, provide 'unit_price' and set 'price_found' true.
-    3. If not matched, set 'unit_price' 0 and 'price_found' false.
-    4. Calculate 'total' as qty * unit_price.
-    Return JSON format: {{"items": [{{"name": str, "qty": float, "unit_price": float, "total": float, "price_found": bool}}]}}
+    USER TRANSCRIPT: "{transcript}"
+    
+    TASK: Extract items and match them to the catalog.
+    RULES:
+    1. If the item matches a catalog SKU (even with minor typos), use the catalog price.
+    2. If an item is NOT in the catalog (e.g. 'kitty banana'), set 'unit_price' to 0 and 'price_found' to false.
+    3. Return valid JSON only.
+    
+    FORMAT:
+    {{
+      "items": [
+        {{"name": "SKU Name", "qty": 1, "unit_price": 0.0, "total": 0.0, "price_found": true}}
+      ],
+      "currency": "AED"
+    }}
     """
     
-    response = client.chat.completions.create(
-        model=deployment,
-        messages=[{"role": "system", "content": prompt}],
-        response_format={"type": "json_object"}
-    )
-    # Parse the text response into a Python dictionary
-    return json.loads(response.choices[0].message.content)
+    try:
+        response = client.chat.completions.create(
+            model=deployment,
+            messages=[{"role": "system", "content": prompt}],
+            response_format={"type": "json_object"}
+        )
+        result = json.loads(response.choices[0].message.content)
+        logging.info(f"✅ GPT matched {len(result.get('items', []))} items.")
+        return result
+    except Exception as e:
+        logging.error(f"❌ GPT ERROR: {str(e)}")
+        return {"items": []}
 
 def format_invoice(data):
-    """Formats a user-friendly WhatsApp message with Markdown bolding."""
-    msg = "✅ *Order Confirmed*\n---\n"
-    for item in data.get('items', []):
-        name = item.get('name', 'Item')
+    """Formats a WhatsApp message. Marks missing catalog items as Out of Stock."""
+    logging.info("Formatting WhatsApp invoice with Out of Stock logic...")
+    
+    currency = data.get('currency', 'AED')
+    items = data.get('items', [])
+    
+    if not items:
+        return "❌ *Order Error*\nWe couldn't recognize any items. Please try again."
+
+    msg = "📝 *Order Summary*\n"
+    msg += "---\n"
+    
+    grand_total = 0
+    has_out_of_stock = False
+
+    for item in items:
+        name = item.get('name', 'Unknown Item')
         qty = item.get('qty', 1)
-        price = item.get('price', 0)
-        msg += f"• {name} (x{qty}): {qty * price} {data.get('currency', '')}\n"
-    msg += f"\n*Total Amount: {data.get('total', 0)} {data.get('currency', '')}*"
-    msg += "\n\nWe are preparing your order now!"
+        price = item.get('unit_price', 0)
+        found = item.get('price_found', True)
+        
+        # If item is in catalog and has a price > 0
+        if found and price > 0:
+            item_total = qty * price
+            grand_total += item_total
+            msg += f"• *{name}* (x{qty})\n  Price: {item_total} {currency}\n"
+        else:
+            # Item not in catalog (e.g., "Kitty Banana")
+            msg += f"• ~{name}~ \n  ❌ *OUT OF STOCK*\n"
+            has_out_of_stock = True
+
+    msg += "---\n"
+    msg += f"*Total Payable: {grand_total} {currency}*\n\n"
+    
+    if has_out_of_stock:
+        msg += "⚠️ _Items crossed out above are currently unavailable and were not added to the total._\n\n"
+        msg += "Would you like to replace the out-of-stock items with something else?"
+    else:
+        msg += "✅ All items are available! We are preparing your order now."
     return msg
 
 def send_whatsapp_message(to, body, sid, auth, from_num):
@@ -248,23 +292,53 @@ def get_catalog_context(conn_str, container, blob_name):
         service_client = BlobServiceClient.from_connection_string(conn_str)
         blob_client = service_client.get_blob_client(container=container, blob=blob_name)
         
+        # Check if blob exists before downloading
+        if not blob_client.exists():
+            logging.error(f"❌ BLOB NOT FOUND: '{blob_name}' in container '{container}'")
+            return "ERROR: Catalog file missing."
+
         blob_data = blob_client.download_blob().readall()
         ext = blob_name.split('.')[-1].lower()
+        
+        df = pd.DataFrame() # Initialize empty
 
-        if ext in ['xlsx', 'xls', 'xlsb']:
+        if ext == 'xlsb':
+            # REQUIREMENT: pip install pyxlsb
+            logging.info("Detected XLSB format. Using pyxlsb engine...")
+            df = pd.read_excel(io.BytesIO(blob_data), engine='pyxlsb')
+            
+        elif ext in ['xlsx', 'xls']:
+            logging.info(f"Detected {ext.upper()} format. Using default engine...")
             df = pd.read_excel(io.BytesIO(blob_data))
-            logging.info(f"Excel loaded: {len(df)} items found.")
-            return df.to_csv(index=False, sep="|") # CSV is token-efficient for GPT
             
         elif ext == 'pdf':
-            # PyMuPDF4LLM is great for converting PDF tables to Markdown
+            import pymupdf4llm
+            logging.info("Detected PDF format. Converting to Markdown...")
             with open("/tmp/catalog.pdf", "wb") as f:
                 f.write(blob_data)
             md_text = pymupdf4llm.to_markdown("/tmp/catalog.pdf")
-            logging.info(f"PDF converted to Markdown. Length: {len(md_text)}")
             return md_text
-            
-        return "Warning: Unsupported catalog format."
+        
+        else:
+            logging.warning(f"Unsupported format: {ext}")
+            return "Warning: Unsupported catalog format."
+
+        # --- DATA VALIDATION & CLEANING ---
+        if df.empty:
+            logging.error("❌ CATALOG LOADED BUT EMPTY: No rows found in the sheet.")
+            return "No catalog data available."
+
+        # CLEANING: Remove empty rows/cols and strip whitespace
+        df.dropna(how='all', inplace=True)
+        df.columns = [str(c).strip() for c in df.columns]
+        
+        # Log success details
+        logging.info(f"✅ SUCCESS: Catalog loaded with {len(df)} rows.")
+        logging.info(f"Columns available: {list(df.columns)}")
+
+        # Convert to Pipe-Separated CSV (More token-efficient for GPT than JSON or standard CSV)
+        return df.to_csv(index=False, sep="|")
+
     except Exception as e:
-        logging.error(f"Catalog Load Error: {str(e)}")
-        return "No catalog data available."
+        logging.error(f"❌ CRITICAL CATALOG ERROR: {str(e)}", exc_info=True)
+        return "No catalog data available due to a system error."
