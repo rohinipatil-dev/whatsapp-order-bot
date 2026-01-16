@@ -169,7 +169,6 @@ def extract_order_with_pricing(transcript, catalog, endpoint, key, deployment):
     "currency": "AED"
     }}
     """
-    
     try:
         response = client.chat.completions.create(
             model=deployment,
@@ -177,61 +176,70 @@ def extract_order_with_pricing(transcript, catalog, endpoint, key, deployment):
             response_format={"type": "json_object"}
         )
         result = json.loads(response.choices[0].message.content)
+        
+        # --- THE SAFETY BRIDGE: Clean the data for Python ---
+        cleaned_items = []
         for item in result.get('items', []):
-            # Ensure values are numbers
-            u_price = float(item.get('unit_price', 0))
+            # 1. Force name to string
+            name = str(item.get('name', 'N/A'))
+            
+            # 2. Force qty and price to floats for math
             qty = float(item.get('qty', 0))
-        # Python handles the math
-        item['total'] = round(u_price * qty, 2)
+            u_price = float(item.get('unit_price', 0))
+            
+            # 3. ROBUST BOOLEAN CHECK (The Fix for the "Not in Stock" error)
+            # This converts "true", "True", or True into a real Python True
+            raw_found = item.get('price_found', False)
+            is_found = str(raw_found).lower() == 'true'
 
-        logging.info(f"✅ GPT matched {len(result.get('items', []))} items.")
+            # 4. MATH GUARD: Python handles the calculation
+            total = round(qty * u_price, 2)
+
+            cleaned_items.append({
+                "name": name,
+                "qty": qty,
+                "unit_price": u_price,
+                "total": total,
+                "price_found": is_found # Real Python Boolean
+            })
+
+        # Update the result with cleaned data
+        result['items'] = cleaned_items
+        logging.info(f"✅ Data Cleaned: Matched {len(cleaned_items)} items.")
         return result
     except Exception as e:
         logging.error(f"❌ GPT ERROR: {str(e)}")
         return {"items": []}
 
 def format_invoice(data):
-    """Formats a WhatsApp message. Marks missing catalog items as Out of Stock."""
-    logging.info("Formatting WhatsApp invoice...")
-    
-    currency = data.get('currency', 'AED')
     items = data.get('items', [])
+    currency = data.get('currency', 'AED')
     
-    if not items:
-        return "❌ *Order Error*\nWe couldn't recognize any items. Please try again or send a photo of your list."
-
-    msg = "📝 *Order Summary*\n"
-    msg += "--------------------------\n"
-    
+    msg = "📝 *Order Summary*\n--------------------------\n"
     grand_total = 0
     has_out_of_stock = False
 
     for item in items:
-        name = item.get('name', 'Unknown Item')
-        qty = item.get('qty', 1)
-        # We use the 'total' calculated by Python in the previous step
-        price_total = item.get('total', 0)
-        found = item.get('price_found', True)
-        
-        if found and price_total > 0:
-            grand_total += price_total
-            msg += f"• *{name}*\n"
-            msg += f"  Qty: {qty} → *{price_total:.2f} {currency}*\n"
+        name = item.get('name')
+        qty = item.get('qty')
+        total = item.get('total', 0)
+        found = item.get('price_found', False)
+
+        # Ensure we only add to total if it's found AND the price is above 0
+        if found is True and total > 0:
+            grand_total += total
+            msg += f"• *{name}* (x{int(qty)})\n  Subtotal: {total:.2f} {currency}\n"
         else:
-            # Item not in catalog or price is 0
-            msg += f"• ~{name}~ (x{qty})\n"
-            msg += f"  ❌ *NOT IN STOCK*\n"
+            msg += f"• ~{name}~ (x{int(qty)})\n  ❌ *NOT IN STOCK*\n"
             has_out_of_stock = True
 
     msg += "--------------------------\n"
     msg += f"💰 *Total Payable: {grand_total:.2f} {currency}*\n\n"
     
     if has_out_of_stock:
-        msg += "⚠️ _Items crossed out are currently unavailable and not included in the total._\n\n"
-        msg += "Would you like to replace these with something else?"
+        msg += "⚠️ _Items crossed out are currently unavailable._\n"
     else:
-        msg += "✅ All items are confirmed! We are preparing your order now."
-        
+        msg += "✅ All items confirmed!"     
     return msg
 
 def send_whatsapp_message(to, body, sid, auth, from_num):
