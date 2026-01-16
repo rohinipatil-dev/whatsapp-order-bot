@@ -139,23 +139,34 @@ def extract_order_with_pricing(transcript, catalog, endpoint, key, deployment):
     logging.info(f"--- 🤖 GPT EXTRACTION STARTING ---")
     
     prompt = f"""
-    CATALOG DATA (Pipe-Separated):
+    SYSTEM ROLE: 
+    You are a precise Order Matching Agent. Your job is to extract items from a transcript and match them to the provided Product Catalog.
+
+    CATALOG DATA:
     {catalog}
-    
-    USER TRANSCRIPT: "{transcript}"
-    
-    TASK: Extract items and match them to the catalog.
-    RULES:
-    1. If the item matches a catalog SKU (even with minor typos), use the catalog price.
-    2. If an item is NOT in the catalog (e.g. 'kitty banana'), set 'unit_price' to 0 and 'price_found' to false.
-    3. Return valid JSON only.
-    
-    FORMAT:
+
+    USER TRANSCRIPT:
+    "{transcript}"
+
+    STRICT INSTRUCTIONS:
+    1. MATCHING: Find the closest "Product Name" from the catalog. Ignore minor typos.
+    2. PRICE EXTRACTION: Look only at the price/rate column. Do NOT mistake quantities (e.g., 500ml, 1kg) for the price.
+    3. QUANTITY: Convert words like "ten" or "a dozen" to numbers (10 or 12).
+    4. VALIDATION: If the product is not in the catalog, set price_found to false and unit_price to 0.
+    5. NO MATH: Do not calculate the total yourself. Just provide the qty and unit_price.
+
+    RETURN THIS JSON FORMAT ONLY:
     {{
-      "items": [
-        {{"name": "SKU Name", "qty": 1, "unit_price": 0.0, "total": 0.0, "price_found": true}}
-      ],
-      "currency": "AED"
+    "items": [
+        {{
+        "reasoning": "Explain why you chose this price and name here",
+        "name": "Exact Catalog Name",
+        "qty": 10,
+        "unit_price": 1.0,
+        "price_found": true
+        }}
+    ],
+    "currency": "AED"
     }}
     """
     
@@ -166,6 +177,13 @@ def extract_order_with_pricing(transcript, catalog, endpoint, key, deployment):
             response_format={"type": "json_object"}
         )
         result = json.loads(response.choices[0].message.content)
+        for item in result.get('items', []):
+            # Ensure values are numbers
+            u_price = float(item.get('unit_price', 0))
+            qty = float(item.get('qty', 0))
+        # Python handles the math
+        item['total'] = round(u_price * qty, 2)
+
         logging.info(f"✅ GPT matched {len(result.get('items', []))} items.")
         return result
     except Exception as e:
@@ -174,16 +192,16 @@ def extract_order_with_pricing(transcript, catalog, endpoint, key, deployment):
 
 def format_invoice(data):
     """Formats a WhatsApp message. Marks missing catalog items as Out of Stock."""
-    logging.info("Formatting WhatsApp invoice with Out of Stock logic...")
+    logging.info("Formatting WhatsApp invoice...")
     
     currency = data.get('currency', 'AED')
     items = data.get('items', [])
     
     if not items:
-        return "❌ *Order Error*\nWe couldn't recognize any items. Please try again."
+        return "❌ *Order Error*\nWe couldn't recognize any items. Please try again or send a photo of your list."
 
     msg = "📝 *Order Summary*\n"
-    msg += "---\n"
+    msg += "--------------------------\n"
     
     grand_total = 0
     has_out_of_stock = False
@@ -191,27 +209,29 @@ def format_invoice(data):
     for item in items:
         name = item.get('name', 'Unknown Item')
         qty = item.get('qty', 1)
-        price = item.get('unit_price', 0)
+        # We use the 'total' calculated by Python in the previous step
+        price_total = item.get('total', 0)
         found = item.get('price_found', True)
         
-        # If item is in catalog and has a price > 0
-        if found and price > 0:
-            item_total = qty * price
-            grand_total += item_total
-            msg += f"• *{name}* (x{qty})\n  Price: {item_total} {currency}\n"
+        if found and price_total > 0:
+            grand_total += price_total
+            msg += f"• *{name}*\n"
+            msg += f"  Qty: {qty} → *{price_total:.2f} {currency}*\n"
         else:
-            # Item not in catalog (e.g., "Kitty Banana")
-            msg += f"• ~{name}~ \n  ❌ *OUT OF STOCK*\n"
+            # Item not in catalog or price is 0
+            msg += f"• ~{name}~ (x{qty})\n"
+            msg += f"  ❌ *NOT IN STOCK*\n"
             has_out_of_stock = True
 
-    msg += "---\n"
-    msg += f"*Total Payable: {grand_total} {currency}*\n\n"
+    msg += "--------------------------\n"
+    msg += f"💰 *Total Payable: {grand_total:.2f} {currency}*\n\n"
     
     if has_out_of_stock:
-        msg += "⚠️ _Items crossed out above are currently unavailable and were not added to the total._\n\n"
-        msg += "Would you like to replace the out-of-stock items with something else?"
+        msg += "⚠️ _Items crossed out are currently unavailable and not included in the total._\n\n"
+        msg += "Would you like to replace these with something else?"
     else:
-        msg += "✅ All items are available! We are preparing your order now."
+        msg += "✅ All items are confirmed! We are preparing your order now."
+        
     return msg
 
 def send_whatsapp_message(to, body, sid, auth, from_num):
